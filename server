@@ -1,0 +1,153 @@
+const express = require('express');
+const http = require('http');
+const bodyParser = require('body-parser');
+const cors = require('cors');
+const socketIo = require('socket.io');
+const KalmanFilter = require('kalmanjs'); // Kalman Filter Library
+
+const app = express();
+const server = http.createServer(app);
+
+app.use(cors({
+  origin: 'http://localhost:3000',
+  methods: ['GET', 'POST'],
+  credentials: true,
+}));
+
+const io = socketIo(server, {
+  cors: {
+    origin: "http://localhost:3000",
+    methods: ["GET", "POST"],
+    credentials: true,
+  },
+});
+
+// Stationary ESP32 position
+const stationaryDevice = { x: 302, y: 0 }; 
+
+// Fingerprint database
+const fingerprintDatabase = [
+  { x: 302, y: 140, rssi: -61 },
+  { x: 302, y: 70, rssi: -56 },
+  { x: 226.5, y: 140, rssi: -55 },
+  { x: 226.5, y: 70, rssi: -61 },
+  { x: 226.5, y: 0, rssi: -48 },
+  { x: 151, y: 140, rssi: -69 },
+  { x: 151, y: 70, rssi: -73 },
+  { x: 151, y: 0, rssi: -59 },
+  { x: 75.5, y: 140, rssi: -65 },
+  { x: 75.5, y: 70, rssi: -76 },
+  { x: 75.5, y: 0, rssi: -55 },
+  { x: 0, y: 140, rssi: -67 },
+  { x: 0, y: 70, rssi: -81 },
+  { x: 0, y: 0, rssi: -62 },
+];
+
+// Initialize Kalman filters for each device
+const kalmanFilters = {};
+
+function getKalmanFilter(device) {
+  if (!kalmanFilters[device]) {
+    kalmanFilters[device] = new KalmanFilter({ R: 1, Q: 3 }); // R: noise, Q: process variance
+  }
+  return kalmanFilters[device];
+}
+
+// Function to calculate weighted position
+function calculateWeightedPosition(rssi, k = 3) {
+  const weightedPositions = fingerprintDatabase.map((fingerprint) => {
+    const weight = 1 / Math.abs(fingerprint.rssi - rssi); // Inverse difference
+    return {
+      x: fingerprint.x,
+      y: fingerprint.y,
+      weight: weight,
+    };
+  });
+
+  weightedPositions.sort((a, b) => b.weight - a.weight);
+  const topK = weightedPositions.slice(0, k);
+
+  let totalWeight = 0, weightedX = 0, weightedY = 0;
+  topK.forEach((pos) => {
+    totalWeight += pos.weight;
+    weightedX += pos.x * pos.weight;
+    weightedY += pos.y * pos.weight;
+  });
+
+  return {
+    x: weightedX / totalWeight,
+    y: weightedY / totalWeight,
+  };
+}
+
+// BLE signal strength data
+let bleData = {};
+const INACTIVITY_THRESHOLD = 10000;
+
+app.use(bodyParser.urlencoded({ extended: true }));
+app.use(bodyParser.json());
+
+app.post('/update-location', (req, res) => {
+  const { device, rssi, esp32_address } = req.body;
+
+  if (!device || !rssi || !esp32_address) {
+    return res.status(400).send('Missing required fields');
+  }
+
+  console.log(`Received data: Device=${device}, RSSI=${rssi}, ESP32=${esp32_address}`);
+
+  if (!bleData[device]) {
+    bleData[device] = { rssi: [], position: null, lastUpdateTime: Date.now() };
+  }
+
+  const kalmanFilter = getKalmanFilter(device);
+  const filteredRSSI = kalmanFilter.filter(Number(rssi));
+
+  bleData[device].rssi.push(filteredRSSI);
+  bleData[device].lastUpdateTime = Date.now();
+
+  if (bleData[device].rssi.length > 10) bleData[device].rssi.shift();
+
+  const avgRssi = bleData[device].rssi.reduce((sum, value) => sum + value, 0) / bleData[device].rssi.length;
+  const position = calculateWeightedPosition(avgRssi);
+
+  if (position) {
+    bleData[device].position = position;
+
+    const distance = Math.sqrt(
+      Math.pow(position.x - stationaryDevice.x, 2) +
+      Math.pow(position.y - stationaryDevice.y, 2)
+    );
+
+    console.log(`Updated position for ${device}: (${position.x}, ${position.y}), Distance=${distance.toFixed(2)}`);
+  }
+
+  io.emit('updateCanvas', { stationaryDevice, bleData });
+  res.sendStatus(200);
+});
+
+setInterval(() => {
+  const currentTime = Date.now();
+  for (const device in bleData) {
+    if (currentTime - bleData[device].lastUpdateTime > INACTIVITY_THRESHOLD) {
+      console.log(`Removing inactive device: ${device}`);
+      delete bleData[device];
+      delete kalmanFilters[device];
+    }
+  }
+  io.emit('updateCanvas', { stationaryDevice, bleData });
+}, 1000);
+
+io.on('connection', (socket) => {
+  console.log('Client connected');
+  socket.emit('updateCanvas', { stationaryDevice, bleData });
+
+  socket.on('disconnect', () => {
+    console.log('Client disconnected');
+  });
+});
+
+const PORT = 3000;
+server.listen(PORT, () => {
+  console.log(`Server is running on port ${PORT}`);
+});
